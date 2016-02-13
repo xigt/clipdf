@@ -1,0 +1,148 @@
+#!/bin/bash
+
+usage() { cat <<EOF
+usage: clipdf [-o OUTFILE] [-r][-m] FILE PAGE LLX LLY URX URY
+
+Clip a part of a PDF using the native PDF point coordinates
+
+ARGUMENTS:
+  FILE               : the PDF file to clip from
+  PAGE               : the page number to clip from (starting from 1)
+  LLX, LLY, URX, URY : the lower-left x and y and upper-right x and y
+                       coordinates, in points (you can think of this as
+                       LEFT, BOTTOM, RIGHT, TOP)
+
+OPTIONS:
+  -o F, --output F   : the output filename F, by default this is
+                       \${FILE%.*}_PAGE_LLX_LLY_URX_URY.pdf
+  -r, --render       : render the result as a PNG image instead of a PDF
+  -m, --margin       : give the result a 1pt margin
+  -h, --help         : display this help message
+
+EXAMPLES:
+  clipdf orig.pdf 1 48.3 57.1 289.7 143.5
+  clipdf -o clip.png -r orig.pdf 1 48.3 57.1 289.7 143.5
+
+EOF
+}
+
+# return exit status of first failing (last non-zero) command in a pipe
+set -o pipefail
+
+# float operations
+gt() { test `echo "$1 > $2" | bc` -eq 1; }
+sub() { echo "($1)-($2)" | bc; }
+mul() { echo "($1)*($2)" | bc; }
+
+# get relevant info from pdfinfo
+page-size() {
+  pdfinfo -box -f $2 -l $2 $1 \
+    | sed -rn "s/Page *$2 size: *([0-9.]+) x ([0-9.]+).*/\1\n\2/p"
+}
+
+# default options
+OUTFILE=''
+DEVICE='pdfwrite'
+SUFF=pdf
+DPI=72
+SCALE=1
+MARGIN=''
+
+while [ $# -gt 6 ]; do
+  case "$1" in
+    -o|--output)
+      OUTFILE="$2"
+      shift 2
+      ;;
+    -r|--render)
+      DEVICE=pngalpha
+      SUFF=png
+      SCALE=8
+      shift
+      ;;
+    -m|--margin)
+      MARGIN='margin'
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ $# -lt 6 ]; then
+  usage
+  exit 1
+fi
+
+INFILE="$1"
+PAGE="$2"
+LLX="$3"
+LLY="$4"
+URX="$5"
+URY="$6"
+
+# make sure LLs are less than URs
+if gt $LLX $URX; then
+  echo "LLX should be less than URX; swapping."
+  TMP=$LLX; LLX=$URX; URX=$TMP
+fi
+if gt $LLY $URY; then
+  echo "LLY should be less than URY; swapping."
+  TMP=$LLY; LLY=$URY; URY=$TMP
+fi
+
+# default OUTFILE setting
+if [ -z "$OUTFILE" ]; then
+  OUTFILE="${INFILE%.*}_${PAGE}_${LLX}_${LLY}_${URX}_${URY}.$SUFF"
+fi
+
+SIZE=( $( page-size "$INFILE" "$PAGE" ) )
+if [ "$?" -ne 0 ]; then
+  echo "Invalid PDF file ($INFILE) or page number ($PAGE); exiting"
+  exit 1
+fi
+
+# check if coords are valid for width and height
+W=${SIZE[0]}
+H=${SIZE[1]}
+if gt 0 $LLX || gt 0 $LLY || gt 0 $URX || gt 0 $URY; then
+  echo "Coordinates cannot be less than zero."
+  exit 1
+fi
+if gt $LLX $W || gt $LLY $H || gt $URX $W || gt $URY $H; then
+  echo "Coordinates cannot be greater than the page width/height ($W x $H)"
+  exit 1
+fi
+
+# adjust coords for some margin
+if [ "$MARGIN" ]; then
+  LLX=`sub $LLX 1`
+  LLY=`sub $LLY 3`
+  URX=`sub $URX "-1"`
+  URY=`sub $URY "-1"`
+fi
+
+# from here we don't care about page width/height, but clip width/height
+W=`sub $URX $LLX`
+H=`sub $URY $LLY`
+
+gs \
+  -o "$OUTFILE" \
+  -sDEVICE=$DEVICE \
+  -dDEVICEWIDTHPOINTS=$W \
+  -dDEVICEHEIGHTPOINTS=$H \
+  -dFIXEDMEDIA \
+  -r`mul $DPI $SCALE` \
+  -dDownScaleFactor=4 \
+  -dFirstPage=$PAGE \
+  -dLastPage=$PAGE \
+  -c "<</Install {-$LLX -$LLY translate}>> setpagedevice" \
+  -f "$INFILE"
+
+
